@@ -1,226 +1,270 @@
 // File_System.cpp
 #include "File_System.hpp"
-#include <iostream>
-#include <sstream>
+#include <chrono>
 #include <iomanip>
+#include <sstream>
+#include <iostream>
+#include <cstdlib>
 
-FileSystem::FileSystem(const std::string& appName, size_t maxLogSize)
-    : appName(appName),
-    maxLogSize(maxLogSize),
-    isMonitoring(false) {
-    appDir = getAppDataPath() + "/Tutones_External_Mod_Menu/" + appName;
-    backupDir = appDir + "/backup";
-    logFile = appDir + "/app.log";
+FileSystem::FileSystem(const std::string& appName, size_t maxLogSize, const std::string& logFileBaseName)
+    : appName_(appName), maxLogSize_(maxLogSize), baseLogFileName_(logFileBaseName)
+{
+    appDataDir_ = fs::current_path() / (appName_ + "_data");
+    backupDir_ = appDataDir_ / "backup";
+    activeLogFileName_ = baseLogFileName_ + "_" + currentDate() + ".txt";
+    logFilePath_ = appDataDir_ / activeLogFileName_;
 }
 
 FileSystem::~FileSystem() {
     stopMonitoring();
+    stopAsyncBackup();
 }
 
-std::string FileSystem::getAppDataPath() {
-#ifdef _WIN32
-    char* buffer = nullptr;
-    size_t size = 0;
-    if (_dupenv_s(&buffer, &size, "APPDATA") == 0 && buffer != nullptr) {
-        std::string appDataPath(buffer);
-        free(buffer); // Free the allocated memory
-        return appDataPath;
-    }
-    return "C:/Temp";
-#elif __linux__
-    return std::getenv("HOME") ? std::string(std::getenv("HOME")) + "/.config" : "/tmp";
-#else
-    return "/tmp"; // Fallback
-#endif
+std::string FileSystem::getAppDataPath() const {
+    return appDataDir_.string();
 }
 
 bool FileSystem::initialize() {
     try {
-        // Create main directory
-        fs::create_directories(appDir);
+        bool ok = createDirectoriesIfNotExist(appDataDir_) && createDirectoriesIfNotExist(backupDir_);
+        if (!ok) return false;
 
-        // Create backup directory
-        fs::create_directories(backupDir);
-
-        log("File system initialized at: " + appDir);
+        if (!fs::exists(logFilePath_)) {
+            std::ofstream ofs(logFilePath_);
+            if (!ofs) return false;
+        }
         return true;
-    }
-    catch (const fs::filesystem_error& e) {
-        log("Error initializing file system: " + std::string(e.what()));
+    } catch (const std::exception& e) {
+        std::cerr << "Initialize failed: " << e.what() << "\n";
         return false;
     }
 }
 
 bool FileSystem::createFile(const std::string& filename, const std::string& content) {
     try {
-        std::string fullPath = appDir + "/" + filename;
-        std::ofstream file(fullPath);
-        if (!file.is_open()) {
-            log("Failed to create file: " + filename);
-            return false;
-        }
-
-        file << content;
-        file.close();
-
-        log("Created file: " + filename);
+        fs::path filePath = appDataDir_ / filename;
+        std::ofstream ofs(filePath);
+        if (!ofs) return false;
+        ofs << content;
         return true;
-    }
-    catch (const std::exception& e) {
-        log("Error creating file: " + std::string(e.what()));
+    } catch (...) {
         return false;
     }
 }
 
 std::string FileSystem::readFile(const std::string& filename) {
     try {
-        std::string fullPath = appDir + "/" + filename;
-        std::ifstream file(fullPath);
-        if (!file.is_open()) {
-            log("Failed to read file: " + filename);
-            return "";
-        }
-
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        log("Read file: " + filename);
-        return buffer.str();
-    }
-    catch (const std::exception& e) {
-        log("Error reading file: " + std::string(e.what()));
+        fs::path filePath = appDataDir_ / filename;
+        std::ifstream ifs(filePath);
+        if (!ifs) return "";
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        return ss.str();
+    } catch (...) {
         return "";
     }
 }
 
 bool FileSystem::backupFiles() {
     try {
-        auto timestamp = std::chrono::system_clock::now();
-        auto timestampStr = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
-            timestamp.time_since_epoch()).count());
-
-        std::string backupSubDir = backupDir + "/backup_" + timestampStr;
-        fs::create_directory(backupSubDir);
-
-        for (const auto& entry : fs::directory_iterator(appDir)) {
-            if (entry.path().filename() != "backup" && entry.path().filename() != "app.log") {
-                fs::copy(entry.path(), backupSubDir + "/" + entry.path().filename().string());
+        for (const auto& entry : fs::directory_iterator(appDataDir_)) {
+            if (entry.is_regular_file() && entry.path() != logFilePath_) {
+                fs::copy(entry.path(), backupDir_ / entry.path().filename(),
+                         fs::copy_options::overwrite_existing);
             }
         }
-
-        log("Backup completed to: " + backupSubDir);
         return true;
-    }
-    catch (const fs::filesystem_error& e) {
-        log("Backup failed: " + std::string(e.what()));
+    } catch (...) {
         return false;
     }
 }
 
 void FileSystem::startMonitoring() {
-    if (isMonitoring) return;
-
-    isMonitoring = true;
-    monitorThread = std::thread(&FileSystem::monitorDirectory, this);
-    log("Started directory monitoring");
+    if (isMonitoring_) return;
+    isMonitoring_ = true;
+    monitorThread_ = std::thread(&FileSystem::monitorDirectory, this);
 }
 
 void FileSystem::stopMonitoring() {
-    if (!isMonitoring) return;
+    if (!isMonitoring_) return;
+    isMonitoring_ = false;
+    monitorCv_.notify_all();
+    if (monitorThread_.joinable()) monitorThread_.join();
+}
 
-    isMonitoring = false;
-    monitorCv.notify_all();
-    if (monitorThread.joinable()) {
-        monitorThread.join();
+void FileSystem::startAsyncBackup() {
+    if (isBackingUp_) return;
+    isBackingUp_ = true;
+    backupThread_ = std::thread([this]() {
+        while (isBackingUp_) {
+            backupFiles();
+            compressOldLogs();
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        }
+    });
+}
+
+void FileSystem::stopAsyncBackup() {
+    if (!isBackingUp_) return;
+    isBackingUp_ = false;
+    if (backupThread_.joinable()) backupThread_.join();
+}
+
+void FileSystem::log(const std::string& message, LogLevel level) {
+    std::string timestamp = currentTimestamp();
+    std::string levelStr = logLevelToString(level);
+    std::string json = toJsonLog(timestamp, levelStr, message);
+
+    {
+        std::lock_guard<std::mutex> lock(logMutex_);
+        logQueue_.push(json);
     }
-    log("Stopped directory monitoring");
+    monitorCv_.notify_all();
 }
 
 void FileSystem::monitorDirectory() {
-    std::unique_lock<std::mutex> lock(logMutex);
+    while (isMonitoring_) {
+        std::unique_lock<std::mutex> lock(logMutex_);
+        monitorCv_.wait_for(lock, std::chrono::seconds(1), [this]() {
+            return !logQueue_.empty() || !isMonitoring_;
+        });
+        if (!isMonitoring_) break;
 
-    while (isMonitoring) {
-        // Simple monitoring: check for new/deleted files
-        static std::vector<std::string> lastFiles;
-        std::vector<std::string> currentFiles;
-
-        for (const auto& entry : fs::directory_iterator(appDir)) {
-            if (entry.path().filename() != "backup" && entry.path().filename() != "app.log") {
-                currentFiles.push_back(entry.path().filename().string());
-            }
-        }
-
-        // Detect changes
-        for (const auto& file : currentFiles) {
-            if (std::find(lastFiles.begin(), lastFiles.end(), file) == lastFiles.end()) {
-                log("New file detected: " + file);
-            }
-        }
-        for (const auto& file : lastFiles) {
-            if (std::find(currentFiles.begin(), currentFiles.end(), file) == currentFiles.end()) {
-                log("File deleted: " + file);
-            }
-        }
-
-        lastFiles = currentFiles;
-
-        // Wait for next check or stop signal
-        monitorCv.wait_for(lock, std::chrono::seconds(5), [this] { return !isMonitoring; });
+        processLogQueue();
+        watchFilesForChanges();
+        if (needsLogRotation()) rotateLogFile();
     }
-}
-
-void FileSystem::log(const std::string& message) {
-    auto now = std::chrono::system_clock::now();
-    auto now_c = std::chrono::system_clock::to_time_t(now);
-    std::tm localTime;
-    localtime_s(&localTime, &now_c); // Use localtime_s for safer time conversion
-
-    std::stringstream ss;
-    ss << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S") << " - " << message;
-
-    {
-        std::lock_guard<std::mutex> lock(logMutex);
-        logQueue.push(ss.str());
-    }
-
-    processLogQueue();
 }
 
 void FileSystem::processLogQueue() {
-    std::lock_guard<std::mutex> lock(logMutex);
-
-    if (needsLogRotation()) {
-        rotateLogFile();
-    }
-
-    std::ofstream logStream(logFile, std::ios::app);
-    if (!logStream.is_open()) return;
-
-    while (!logQueue.empty()) {
-        logStream << logQueue.front() << "\n";
-        logQueue.pop();
+    std::ofstream ofs(logFilePath_, std::ios::app);
+    while (!logQueue_.empty()) {
+        ofs << logQueue_.front() << "\n";
+        std::cout << logQueue_.front() << "\n"; // live console tail
+        logQueue_.pop();
     }
 }
 
 bool FileSystem::needsLogRotation() {
     try {
-        return fs::exists(logFile) && fs::file_size(logFile) >= maxLogSize;
-    }
-    catch (const fs::filesystem_error&) {
+        std::string today = currentDate();
+        std::string expectedName = baseLogFileName_ + "_" + today + ".txt";
+        if (activeLogFileName_ != expectedName) return true;
+        if (fs::exists(logFilePath_) && fs::file_size(logFilePath_) >= maxLogSize_) return true;
+        return false;
+    } catch (...) {
         return false;
     }
 }
 
 void FileSystem::rotateLogFile() {
     try {
-        auto timestamp = std::chrono::system_clock::now();
-        auto timestampStr = std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
-            timestamp.time_since_epoch()).count());
+        std::string todayName = baseLogFileName_ + "_" + currentDate() + ".txt";
+        if (activeLogFileName_ != todayName) {
+            activeLogFileName_ = todayName;
+            logFilePath_ = appDataDir_ / activeLogFileName_;
+            std::ofstream ofs(logFilePath_);
+        } else {
+            std::string rotated = baseLogFileName_ + "_" + currentDate() + "_" + currentTimestamp() + ".txt";
+            fs::rename(logFilePath_, appDataDir_ / rotated);
+            std::ofstream ofs(logFilePath_);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Rotation failed: " << e.what() << "\n";
+    }
+}
 
-        std::string newLogFile = appDir + "/app_" + timestampStr + ".log";
-        fs::rename(logFile, newLogFile);
-        log("Rotated log file to: " + newLogFile);
+void FileSystem::compressOldLogs() {
+    try {
+        for (const auto& entry : fs::directory_iterator(appDataDir_)) {
+            if (entry.is_regular_file()) {
+                auto path = entry.path();
+                if (path.extension() == ".txt" && path.filename() != activeLogFileName_) {
+                    std::string zipName = path.stem().string() + ".zip";
+                    std::string cmd = "zip -j \"" + (appDataDir_ / zipName).string() + "\" \"" + path.string() + "\"";
+                    if (std::system(cmd.c_str()) == 0) {
+                        fs::remove(path);
+                    }
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Compress failed: " << e.what() << "\n";
     }
-    catch (const fs::filesystem_error& e) {
-        std::cerr << "Log rotation failed: " << e.what() << std::endl;
+}
+
+void FileSystem::watchFilesForChanges() {
+    try {
+        for (const auto& entry : fs::directory_iterator(appDataDir_)) {
+            if (entry.is_regular_file()) {
+                auto path = entry.path();
+                auto currentTime = fs::last_write_time(path);
+                auto it = fileTimes_.find(path.string());
+                if (it == fileTimes_.end()) {
+                    fileTimes_[path.string()] = currentTime;
+                } else if (currentTime != it->second) {
+                    it->second = currentTime;
+                    std::cout << "File changed: " << path.filename() << "\n";
+                }
+            }
+        }
+    } catch (...) {
+        // ignore errors
     }
+}
+
+bool FileSystem::createDirectoriesIfNotExist(const fs::path& path) {
+    try {
+        if (!fs::exists(path)) return fs::create_directories(path);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string FileSystem::currentTimestamp() const {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#if defined(_WIN32) || defined(_WIN64)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    std::ostringstream ss;
+    ss << std::put_time(&tm, "%Y%m%d_%H%M%S");
+    return ss.str();
+}
+
+std::string FileSystem::currentDate() const {
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#if defined(_WIN32) || defined(_WIN64)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    std::ostringstream ss;
+    ss << std::put_time(&tm, "%Y%m%d");
+    return ss.str();
+}
+
+std::string FileSystem::logLevelToString(LogLevel level) const {
+    switch (level) {
+        case LogLevel::INFO: return "INFO";
+        case LogLevel::WARN: return "WARN";
+        case LogLevel::ERROR: return "ERROR";
+    }
+    return "UNKNOWN";
+}
+
+std::string FileSystem::toJsonLog(const std::string& timestamp, const std::string& level, const std::string& message) const {
+    std::ostringstream ss;
+    ss << "{"
+       << "\"timestamp\":\"" << timestamp << "\","
+       << "\"level\":\"" << level << "\","
+       << "\"message\":\"" << message << "\""
+       << "}";
+    return ss.str();
 }
